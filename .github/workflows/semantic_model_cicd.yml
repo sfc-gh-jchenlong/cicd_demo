@@ -1,0 +1,409 @@
+name: Semantic Model CI/CD
+
+# Required Variables: DATABASE_DEV/PROD, SCHEMA_DEV/PROD, WAREHOUSE_DEV/PROD, ROLE
+# Optional: STAGE (default: ''), EVAL_MODEL (default: llama3.1-70b), PERFORMANCE_THRESHOLD (default: 90)
+
+on:
+  push:
+    branches: [ dev ]
+    paths: 
+      - 'sql/create_semantic_view.sql'
+      - '.github/workflows/semantic_model_cicd.yml'
+  pull_request:
+    branches: [ main ]
+    paths: 
+      - 'sql/create_semantic_view.sql'
+      - '.github/workflows/semantic_model_cicd.yml'
+
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: write
+
+env:
+  PERFORMANCE_THRESHOLD: ${{ vars.PERFORMANCE_THRESHOLD || '90' }}
+  EVAL_MODEL: ${{ vars.EVAL_MODEL || 'llama3.1-70b' }}
+  STAGE: ${{ vars.STAGE || '' }}
+  INPUT_TEST_TABLE: ${{ vars.INPUT_TEST_TABLE || 'GENAI_UTILITIES.EVALUATION.SQL_SAMPLE_RESULTS' }}
+
+jobs:
+  dev-deploy:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/dev'
+    
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup
+      run: |
+        pip install snowflake-cli-labs
+        sudo apt-get update && sudo apt-get install -y bc
+      
+    - name: Deploy and Evaluate DEV
+      id: deploy_eval
+      env:
+        SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+        SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+        SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        SNOWFLAKE_WAREHOUSE: ${{ vars.WAREHOUSE_DEV }}
+        SNOWFLAKE_DATABASE: ${{ vars.DATABASE_DEV }}
+        SNOWFLAKE_SCHEMA: ${{ vars.SCHEMA_DEV }}
+        SNOWFLAKE_ROLE: ${{ vars.ROLE }}
+      run: |
+        # Deploy
+        snow connection test --temporary-connection
+        echo "🚀 Deploying to DEV..."
+        snow sql --temporary-connection -f sql/create_semantic_view.sql -x
+        
+        # Validate
+        snow sql --temporary-connection -x -q "DESCRIBE SEMANTIC VIEW TIME_SERIES_REVENUE_V_VIEW" > results.txt
+        if grep -q "Error" results.txt; then
+          echo "❌ Deployment failed"; cat results.txt; exit 1
+        fi
+        
+        # Check if semantic view exists 
+        echo "📋 Checking semantic view..."
+        snow sql --temporary-connection -x -q "SHOW SEMANTIC VIEWS LIKE 'TIME_SERIES_REVENUE_V_VIEW'" >> results.txt 2>&1
+        
+        # Evaluate with error handling
+        echo "📊 Running evaluation..."
+        echo "Variables: database=${{ vars.DATABASE_DEV }}, schema=${{ vars.SCHEMA_DEV }}, semantic_view=TIME_SERIES_REVENUE_V_VIEW"
+        EVAL_EXIT_CODE=0
+        snow sql --temporary-connection -f sql/orchestrate_evaluation.sql \
+          --variable database="${{ vars.DATABASE_DEV }}" \
+          --variable schema="${{ vars.SCHEMA_DEV }}" \
+          --variable warehouse="${{ vars.WAREHOUSE_DEV }}" \
+          --variable role="${{ vars.ROLE }}" \
+          --variable semantic_stage="${{ env.STAGE }}" \
+          --variable semantic_model_file="TIME_SERIES_REVENUE_V_VIEW" \
+          --variable evaluation_model="${{ env.EVAL_MODEL }}" \
+          --variable input_test_table="${{ env.INPUT_TEST_TABLE }}" \
+          >> results.txt 2>&1 || EVAL_EXIT_CODE=$?
+        
+        # Always set default values first
+        echo "accuracy=0" >> $GITHUB_OUTPUT
+        echo "status=warning" >> $GITHUB_OUTPUT
+        
+        # Parse accuracy with robust extraction
+        echo "📊 Parsing evaluation results (exit code: ${EVAL_EXIT_CODE})..."
+        echo "=== RESULTS.TXT CONTENT ==="
+        cat results.txt
+        echo "=== END RESULTS.TXT ==="
+        
+        # Check for specific issues in evaluation
+        ERROR_COUNT=$(grep -c "\[ERROR\]:" results.txt || echo "0")
+        CORTEX_ERRORS=$(grep -c "Cortex.*Error\|Failed request with status" results.txt || echo "0")
+        
+        echo "📊 Evaluation analysis: Errors=${ERROR_COUNT}, Cortex_Errors=${CORTEX_ERRORS}"
+        
+        # Only try to extract accuracy if evaluation didn't fail completely
+        if [ "$EVAL_EXIT_CODE" -eq 0 ]; then
+          # Try multiple patterns to extract accuracy (optimized for orchestrate_evaluation.sql output)
+          ACCURACY=$(grep -oP 'Evaluation complete: [0-9]+/[0-9]+ correct \(\K[0-9]+\.?[0-9]*(?=%\))' results.txt | tail -1)
+          if [ -z "$ACCURACY" ]; then
+            ACCURACY=$(grep -oP 'correct \(\K[0-9]+\.?[0-9]*(?=%\))' results.txt | tail -1)
+          fi
+          if [ -z "$ACCURACY" ]; then
+            ACCURACY=$(grep -oP '\(\K[0-9]+\.?[0-9]*(?=%\))' results.txt | tail -1)
+          fi
+          if [ -z "$ACCURACY" ]; then
+            ACCURACY=$(grep -oP '[0-9]+\.?[0-9]*(?=% accuracy)' results.txt | tail -1)
+          fi
+          
+          # Update outputs if we found accuracy
+          if [ -n "$ACCURACY" ] && [ "$ACCURACY" != "0" ]; then
+            echo "accuracy=${ACCURACY}" >> $GITHUB_OUTPUT
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "✅ DEV complete - Accuracy: ${ACCURACY}%"
+          else
+            # Provide specific feedback about what went wrong
+            if [ "$ERROR_COUNT" -gt 0 ]; then
+              echo "⚠️ DEV complete - ${ERROR_COUNT} SQL generation errors detected"
+              echo "error_type=sql_generation" >> $GITHUB_OUTPUT
+            elif [ "$CORTEX_ERRORS" -gt 0 ]; then
+              echo "⚠️ DEV complete - ${CORTEX_ERRORS} Cortex Analyst errors detected"
+              echo "error_type=cortex_analyst" >> $GITHUB_OUTPUT
+            else
+              echo "⚠️ DEV complete - Could not extract accuracy from evaluation output"
+              echo "error_type=parsing" >> $GITHUB_OUTPUT
+            fi
+          fi
+        else
+          echo "❌ DEV evaluation failed with exit code: ${EVAL_EXIT_CODE}"
+          echo "status=failure" >> $GITHUB_OUTPUT
+          echo "error_type=execution" >> $GITHUB_OUTPUT
+        fi
+      
+    - name: Set Status
+      uses: actions/github-script@v7
+      if: always()
+      with:
+        script: |
+          const accuracy = '${{ steps.deploy_eval.outputs.accuracy }}';
+          const status = '${{ steps.deploy_eval.outputs.status }}';
+          const success = '${{ steps.deploy_eval.outcome }}' === 'success';
+          
+          let state = 'success';
+          let message = `✅ DEV deployed (${accuracy}% accuracy)`;
+          
+          if (!success) {
+            state = 'failure';
+            message = '❌ DEV deployment failed';
+          } else if (status === 'warning') {
+            state = 'success'; // Don't block DEV, but note the warning
+            message = `⚠️ DEV deployed (accuracy unclear)`;
+          }
+          
+          await github.rest.repos.createCommitStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            sha: context.sha,
+            state: state,
+            target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            description: message,
+            context: 'semantic-model/dev-deployment'
+          });
+      
+    - name: Upload Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: dev-results-${{ github.sha }}
+        path: results.txt
+      
+    - name: Summary
+      if: always()
+      run: |
+        ACCURACY="${{ steps.deploy_eval.outputs.accuracy || '0' }}"
+        STATUS="${{ steps.deploy_eval.outputs.status || 'unknown' }}"
+        ERROR_TYPE="${{ steps.deploy_eval.outputs.error_type || 'none' }}"
+        STEP_OUTCOME="${{ steps.deploy_eval.outcome }}"
+        
+        echo "# 🚀 DEV Environment Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Step Outcome**: ${STEP_OUTCOME}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Evaluation Status**: ${STATUS}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Accuracy**: ${ACCURACY}%" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "$STATUS" == "warning" ]; then
+          case "$ERROR_TYPE" in
+                         "sql_generation")
+               echo "- **Issue**: 🔧 SQL generation errors - check semantic view configuration" >> $GITHUB_STEP_SUMMARY
+               ;;
+             "cortex_analyst")
+               echo "- **Issue**: 🤖 Cortex Analyst service errors - check permissions/availability" >> $GITHUB_STEP_SUMMARY
+              ;;
+            "parsing")
+              echo "- **Issue**: 📊 Could not parse accuracy from evaluation results" >> $GITHUB_STEP_SUMMARY
+              ;;
+            *)
+              echo "- **Note**: ⚠️ Accuracy could not be determined from evaluation output" >> $GITHUB_STEP_SUMMARY
+              ;;
+          esac
+        elif [ "$STATUS" == "failure" ]; then
+          echo "- **Note**: ❌ Evaluation step failed completely" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ "$STEP_OUTCOME" == "success" ] && [ "$STATUS" != "failure" ]; then
+          echo "✅ **Ready for PROD**: Create PR from \`dev\` → \`main\`" >> $GITHUB_STEP_SUMMARY
+          if [ "$STATUS" == "warning" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> **Note**: PROD deployment will require clear accuracy metrics" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "❌ **Fix Required**: Address deployment or evaluation issues before creating PR" >> $GITHUB_STEP_SUMMARY
+        fi
+
+  prod-deploy:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup
+      run: |
+        pip install snowflake-cli-labs
+        sudo apt-get update && sudo apt-get install -y bc
+      
+    - name: Deploy and Evaluate PROD
+      id: deploy_eval
+      env:
+        SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+        SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+        SNOWFLAKE_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+        SNOWFLAKE_WAREHOUSE: ${{ vars.WAREHOUSE_PROD }}
+        SNOWFLAKE_DATABASE: ${{ vars.DATABASE_PROD }}
+        SNOWFLAKE_SCHEMA: ${{ vars.SCHEMA_PROD }}
+        SNOWFLAKE_ROLE: ${{ vars.ROLE }}
+      run: |
+        # Deploy
+        snow connection test --temporary-connection
+        echo "🚀 Deploying to PROD..."
+        snow sql --temporary-connection -f sql/create_semantic_view.sql -x
+        
+        # Validate
+        snow sql --temporary-connection -x -q "DESCRIBE SEMANTIC VIEW TIME_SERIES_REVENUE_V_VIEW" > results.txt
+        if grep -q "Error" results.txt; then
+          echo "❌ Deployment failed"; cat results.txt; exit 1
+        fi
+        
+        # Check if semantic view exists 
+        echo "📋 Checking semantic view..."
+        snow sql --temporary-connection -x -q "SHOW SEMANTIC VIEWS LIKE 'TIME_SERIES_REVENUE_V_VIEW'" >> results.txt 2>&1
+        
+        # Evaluate with error handling
+        echo "📊 Running evaluation..."
+        echo "Variables: database=${{ vars.DATABASE_PROD }}, schema=${{ vars.SCHEMA_PROD }}, semantic_view=TIME_SERIES_REVENUE_V_VIEW"
+        EVAL_EXIT_CODE=0
+        snow sql --temporary-connection -f sql/orchestrate_evaluation.sql \
+          --variable database="${{ vars.DATABASE_PROD }}" \
+          --variable schema="${{ vars.SCHEMA_PROD }}" \
+          --variable warehouse="${{ vars.WAREHOUSE_PROD }}" \
+          --variable role="${{ vars.ROLE }}" \
+          --variable semantic_stage="${{ env.STAGE }}" \
+          --variable semantic_model_file="TIME_SERIES_REVENUE_V_VIEW" \
+          --variable evaluation_model="${{ env.EVAL_MODEL }}" \
+          --variable input_test_table="${{ env.INPUT_TEST_TABLE }}" \
+          >> results.txt 2>&1 || EVAL_EXIT_CODE=$?
+        
+        # Always set default values first
+        echo "accuracy=0" >> $GITHUB_OUTPUT
+        echo "gate_passed=false" >> $GITHUB_OUTPUT
+        
+        # Parse accuracy with robust extraction
+        echo "📊 Parsing evaluation results (exit code: ${EVAL_EXIT_CODE})..."
+        echo "=== RESULTS.TXT CONTENT ==="
+        cat results.txt
+        echo "=== END RESULTS.TXT ==="
+        
+        # Check for specific issues in evaluation
+        ERROR_COUNT=$(grep -c "\[ERROR\]:" results.txt || echo "0")
+        CORTEX_ERRORS=$(grep -c "Cortex.*Error\|Failed request with status" results.txt || echo "0")
+        
+        echo "📊 Evaluation analysis: Errors=${ERROR_COUNT}, Cortex_Errors=${CORTEX_ERRORS}"
+        
+        # Check if evaluation succeeded
+        if [ "$EVAL_EXIT_CODE" -ne 0 ]; then
+          echo "❌ PROD evaluation failed with exit code: ${EVAL_EXIT_CODE}"
+          echo "error_type=execution" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+        
+        # Try multiple patterns to extract accuracy (optimized for orchestrate_evaluation.sql output)
+        ACCURACY=$(grep -oP 'Evaluation complete: [0-9]+/[0-9]+ correct \(\K[0-9]+\.?[0-9]*(?=%\))' results.txt | tail -1)
+        if [ -z "$ACCURACY" ]; then
+          ACCURACY=$(grep -oP 'correct \(\K[0-9]+\.?[0-9]*(?=%\))' results.txt | tail -1)
+        fi
+        if [ -z "$ACCURACY" ]; then
+          ACCURACY=$(grep -oP '\(\K[0-9]+\.?[0-9]*(?=%\))' results.txt | tail -1)
+        fi
+        if [ -z "$ACCURACY" ]; then
+          ACCURACY=$(grep -oP '[0-9]+\.?[0-9]*(?=% accuracy)' results.txt | tail -1)
+        fi
+        
+        # Check threshold with robust handling
+        THRESHOLD="${{ env.PERFORMANCE_THRESHOLD }}"
+        if [ -n "$ACCURACY" ] && [ "$ACCURACY" != "0" ]; then
+          echo "accuracy=${ACCURACY}" >> $GITHUB_OUTPUT
+          MEETS_THRESHOLD=$(echo "${ACCURACY} >= ${THRESHOLD}" | bc -l)
+          if [ "$MEETS_THRESHOLD" -eq 1 ]; then
+            echo "✅ PROD complete - Accuracy: ${ACCURACY}% (≥${THRESHOLD}%)"
+            echo "gate_passed=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Accuracy ${ACCURACY}% below required ${THRESHOLD}%"
+            echo "gate_passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+        else
+          # Provide specific feedback about what went wrong in PROD (more strict)
+          if [ "$ERROR_COUNT" -gt 0 ]; then
+            echo "❌ PROD failed - ${ERROR_COUNT} SQL generation errors detected"
+            echo "error_type=sql_generation" >> $GITHUB_OUTPUT
+          elif [ "$CORTEX_ERRORS" -gt 0 ]; then
+            echo "❌ PROD failed - ${CORTEX_ERRORS} Cortex Analyst errors detected"
+            echo "error_type=cortex_analyst" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Could not determine accuracy from evaluation results"
+            echo "error_type=parsing" >> $GITHUB_OUTPUT
+          fi
+          echo "accuracy=0" >> $GITHUB_OUTPUT
+          echo "gate_passed=false" >> $GITHUB_OUTPUT
+          exit 1
+        fi
+      
+    - name: Set Status
+      uses: actions/github-script@v7
+      if: always()
+      with:
+        script: |
+          const accuracy = '${{ steps.deploy_eval.outputs.accuracy }}';
+          const gatePassed = '${{ steps.deploy_eval.outputs.gate_passed }}' === 'true';
+          const success = '${{ steps.deploy_eval.outcome }}' === 'success' && gatePassed;
+          
+          let message;
+          if (success) {
+            message = `✅ PROD deployed (${accuracy}% accuracy)`;
+          } else if ('${{ steps.deploy_eval.outcome }}' === 'failure') {
+            message = gatePassed === false ? `❌ PROD accuracy ${accuracy}% below threshold` : '❌ PROD deployment failed';
+          } else {
+            message = '❌ PROD deployment failed';
+          }
+          
+          await github.rest.repos.createCommitStatus({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            sha: context.payload.pull_request.head.sha,
+            state: success ? 'success' : 'failure',
+            target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            description: message,
+            context: 'semantic-model/prod-deployment'
+          });
+      
+    - name: Upload Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: prod-results-${{ github.sha }}
+        path: results.txt
+      
+    - name: Summary
+      if: always()
+      run: |
+        ACCURACY="${{ steps.deploy_eval.outputs.accuracy || '0' }}"
+        GATE_PASSED="${{ steps.deploy_eval.outputs.gate_passed || 'false' }}"
+        ERROR_TYPE="${{ steps.deploy_eval.outputs.error_type || 'none' }}"
+        STEP_OUTCOME="${{ steps.deploy_eval.outcome }}"
+        
+        echo "# 🏭 PROD Environment Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Step Outcome**: ${STEP_OUTCOME}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Accuracy**: ${ACCURACY}%" >> $GITHUB_STEP_SUMMARY
+        echo "- **Threshold**: ≥${{ env.PERFORMANCE_THRESHOLD }}%" >> $GITHUB_STEP_SUMMARY
+        echo "- **Performance Gate**: ${GATE_PASSED}" >> $GITHUB_STEP_SUMMARY
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ "$STEP_OUTCOME" == "success" ] && [ "$GATE_PASSED" == "true" ]; then
+          echo "✅ **Ready for Merge**: All checks passed" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Fix Required**: Address issues before merge" >> $GITHUB_STEP_SUMMARY
+          if [ "$GATE_PASSED" == "false" ] && [ "$ACCURACY" != "0" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "> **Performance Issue**: Accuracy ${ACCURACY}% below required ${{ env.PERFORMANCE_THRESHOLD }}%" >> $GITHUB_STEP_SUMMARY
+          elif [ "$ACCURACY" == "0" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+                         case "$ERROR_TYPE" in
+               "sql_generation")
+                 echo "> **SQL Generation Issue**: Check semantic view and configuration" >> $GITHUB_STEP_SUMMARY
+                 ;;
+               "cortex_analyst")
+                 echo "> **Cortex Analyst Issue**: Check service availability and permissions" >> $GITHUB_STEP_SUMMARY
+                ;;
+              "parsing")
+                echo "> **Parsing Issue**: Could not extract accuracy from evaluation output" >> $GITHUB_STEP_SUMMARY
+                ;;
+              *)
+                echo "> **Evaluation Issue**: Could not determine accuracy from evaluation results" >> $GITHUB_STEP_SUMMARY
+                ;;
+            esac
+          fi
+        fi
