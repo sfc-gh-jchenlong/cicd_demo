@@ -55,18 +55,18 @@ jobs:
         snow sql --temporary-connection -f sql/create_semantic_view.sql -x
         
         # Validate
-        snow sql --temporary-connection -x -q "DESCRIBE SEMANTIC VIEW TIME_SERIES_REVENUE_V_VIEW" > results.txt
+        snow sql --temporary-connection -x -q "DESCRIBE SEMANTIC VIEW SALES_ANALYST_CICD" > results.txt
         if grep -q "Error" results.txt; then
           echo "❌ Deployment failed"; cat results.txt; exit 1
         fi
         
         # Check if semantic view exists 
         echo "📋 Checking semantic view..."
-        snow sql --temporary-connection -x -q "SHOW SEMANTIC VIEWS LIKE 'TIME_SERIES_REVENUE_V_VIEW'" >> results.txt 2>&1
+        snow sql --temporary-connection -x -q "SHOW SEMANTIC VIEWS LIKE 'SALES_ANALYST_CICD'" >> results.txt 2>&1
         
         # Evaluate with error handling
         echo "📊 Running evaluation..."
-        echo "Variables: database=${{ vars.DATABASE_DEV }}, schema=${{ vars.SCHEMA_DEV }}, semantic_view=TIME_SERIES_REVENUE_V_VIEW"
+        echo "Variables: database=${{ vars.DATABASE_DEV }}, schema=${{ vars.SCHEMA_DEV }}, semantic_view=SALES_ANALYST_CICD"
         EVAL_EXIT_CODE=0
         snow sql --temporary-connection -f sql/orchestrate_evaluation.sql \
           --variable database="${{ vars.DATABASE_DEV }}" \
@@ -74,7 +74,7 @@ jobs:
           --variable warehouse="${{ vars.WAREHOUSE_DEV }}" \
           --variable role="${{ vars.ROLE }}" \
           --variable semantic_stage="${{ env.STAGE }}" \
-          --variable semantic_model_file="TIME_SERIES_REVENUE_V_VIEW" \
+          --variable semantic_model_file="SALES_ANALYST_CICD" \
           --variable evaluation_model="${{ env.EVAL_MODEL }}" \
           --variable input_test_table="${{ env.INPUT_TEST_TABLE }}" \
           >> results.txt 2>&1 || EVAL_EXIT_CODE=$?
@@ -242,18 +242,18 @@ jobs:
         snow sql --temporary-connection -f sql/create_semantic_view.sql -x
         
         # Validate
-        snow sql --temporary-connection -x -q "DESCRIBE SEMANTIC VIEW TIME_SERIES_REVENUE_V_VIEW" > results.txt
+        snow sql --temporary-connection -x -q "DESCRIBE SEMANTIC VIEW SALES_ANALYST_CICD" > results.txt
         if grep -q "Error" results.txt; then
           echo "❌ Deployment failed"; cat results.txt; exit 1
         fi
         
         # Check if semantic view exists 
         echo "📋 Checking semantic view..."
-        snow sql --temporary-connection -x -q "SHOW SEMANTIC VIEWS LIKE 'TIME_SERIES_REVENUE_V_VIEW'" >> results.txt 2>&1
+        snow sql --temporary-connection -x -q "SHOW SEMANTIC VIEWS LIKE 'SALES_ANALYST_CICD'" >> results.txt 2>&1
         
         # Evaluate with error handling
         echo "📊 Running evaluation..."
-        echo "Variables: database=${{ vars.DATABASE_PROD }}, schema=${{ vars.SCHEMA_PROD }}, semantic_view=TIME_SERIES_REVENUE_V_VIEW"
+        echo "Variables: database=${{ vars.DATABASE_PROD }}, schema=${{ vars.SCHEMA_PROD }}, semantic_view=SALES_ANALYST_CICD"
         EVAL_EXIT_CODE=0
         snow sql --temporary-connection -f sql/orchestrate_evaluation.sql \
           --variable database="${{ vars.DATABASE_PROD }}" \
