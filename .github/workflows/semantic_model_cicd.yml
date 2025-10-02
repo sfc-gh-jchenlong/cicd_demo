@@ -261,7 +261,7 @@ jobs:
           --variable warehouse="${{ vars.WAREHOUSE_PROD }}" \
           --variable role="${{ vars.ROLE }}" \
           --variable semantic_stage="${{ env.STAGE }}" \
-          --variable semantic_model_file="TIME_SERIES_REVENUE_V_VIEW" \
+          --variable semantic_model_file="SALES_ANALYST_CICD" \
           --variable evaluation_model="${{ env.EVAL_MODEL }}" \
           --variable input_test_table="${{ env.INPUT_TEST_TABLE }}" \
           >> results.txt 2>&1 || EVAL_EXIT_CODE=$?
