@@ -6,7 +6,7 @@ create or replace semantic view DASH_DB_SI.RETAIL.SALES_ANALYST_CICD
 		PRODUCTS
 	)
 	facts (
-		MARKETING_CAMPAIGN_METRICS.CLICKS as CLICKS with synonyms=('click_throughs','selections','hits','taps','activations','click_activity') comment='The total number of times users clicked on an advertisement or promotional link as part of a marketing campaign.',
+		MARKETING_CAMPAIGN_METRICS.CLICKS as CLICKS with synonyms=('click_throughs','selections','hits','taps','activations','click_activities') comment='The total number of times users clicked on an advertisement or promotional link as part of a marketing campaign.',
 		MARKETING_CAMPAIGN_METRICS.IMPRESSIONS as IMPRESSIONS with synonyms=('views','ad_views','ad_exposures','display_count','ad_impressions','exposures','ad_views_count','views_count') comment='The total number of times an ad was displayed to users during a marketing campaign.',
 		PRODUCTS.PRODUCT_ID as PRODUCT_ID with synonyms=('product_key','item_id','product_code','product_number','item_number','product_identifier') comment='Unique identifier for each product in the catalog.'
 	)
